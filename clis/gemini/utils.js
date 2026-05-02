@@ -1,6 +1,16 @@
 import { CommandExecutionError } from '@jackwener/opencli/errors';
 export const GEMINI_DOMAIN = 'gemini.google.com';
-export const GEMINI_APP_URL = 'https://gemini.google.com/app';
+// Honor GEMINI_USER_INDEX env var for multi-account Chrome profiles. When set to N,
+// the adapter operates on https://gemini.google.com/u/N/app, preserving the chosen
+// account across navigation. Default (no env var) uses the primary account.
+function getGeminiAppUrl() {
+    const idx = (typeof process !== 'undefined' && process.env && process.env.GEMINI_USER_INDEX) || '';
+    if (idx && /^[0-9]+$/.test(idx)) {
+        return `https://gemini.google.com/u/${idx}/app`;
+    }
+    return 'https://gemini.google.com/app';
+}
+export const GEMINI_APP_URL = getGeminiAppUrl();
 export const GEMINI_DEEP_RESEARCH_DEFAULT_TOOL_LABELS = ['Deep Research', 'Deep research', '\u6df1\u5ea6\u7814\u7a76', '\u7814\u7a76'];
 export const GEMINI_DEEP_RESEARCH_DEFAULT_CONFIRM_LABELS = [
     'Start research',
@@ -709,36 +719,62 @@ function openGeminiToolsMenuScript() {
         return hasPopup || hasControls;
       };
 
+      // Anchors that are ONLY found in the tools popup, not in the sidebar / chat history.
+      // The sidebar contains conv titles that may include '研究' / 'research' substrings,
+      // which used to trigger a false positive. Requiring at least one tool-specific
+      // anchor avoids that.
+      const TOOLS_POPUP_ANCHORS = ['Canvas', 'Deep Research', 'Deep research', '制作图片', '制作视频', '制作音乐', 'Image', 'Video'];
+      const looksLikeToolsPopup = (el) => {
+        const text = (el.textContent || '');
+        return TOOLS_POPUP_ANCHORS.some((anchor) => text.includes(anchor));
+      };
       const menuAlreadyOpen = () => {
         const visibleMenus = Array.from(document.querySelectorAll('[role="menu"], [role="listbox"]')).filter(isVisible);
-        const labeledMenu = visibleMenus.some((menu) => {
-          const text = menu.textContent || '';
-          const aria = menu.getAttribute('aria-label') || '';
-          return matchesLabel(text) || matchesLabel(aria);
-        });
-        if (labeledMenu) return true;
+        // Tools popup must contain a tool-specific anchor — not just any "研究" substring,
+        // which could be a sidebar conv title like "Iren 和 Cien 公司研究方案".
+        const hasToolsPopup = visibleMenus.some((menu) => looksLikeToolsPopup(menu));
+        if (hasToolsPopup) return true;
         const expanded = Array.from(document.querySelectorAll('[aria-expanded="true"]')).filter(isVisible);
         return expanded.some((node) => {
           if (!(node instanceof HTMLElement)) return false;
-          const text = node.textContent || '';
-          const aria = node.getAttribute('aria-label') || '';
-          return isMenuTrigger(node) && (matchesLabel(text) || matchesLabel(aria));
+          if (!isMenuTrigger(node)) return false;
+          // Require expanded element to have an associated visible popup with anchors.
+          const controls = (node.getAttribute('aria-controls') || '').split(/\\s+/).filter(Boolean);
+          for (const id of controls) {
+            const popup = document.getElementById(id);
+            if (popup && isVisible(popup) && looksLikeToolsPopup(popup)) return true;
+          }
+          return false;
         });
       };
 
       if (menuAlreadyOpen()) return true;
 
+      // The composer's tools-trigger button has EXACT label '工具' or 'Tools' (case-insensitive),
+      // never something longer that contains those words. Sidebar entries like
+      // "Iren 研究方案" must NOT match. Use exact equality only.
+      const TRIGGER_LABELS_EXACT = ['工具', 'tools', 'tool'];
+      const isTriggerLabelMatch = (value) => {
+        const v = (value || '').trim().toLowerCase();
+        return TRIGGER_LABELS_EXACT.includes(v);
+      };
       const pickTarget = (root) => {
         const nodes = Array.from(root.querySelectorAll('button, [role="button"]')).filter(isInteractable);
-        const matches = nodes.filter((node) => {
+        // Prefer exact-label matches (composer's 工具 button) over substring matches.
+        const exactMatches = nodes.filter((node) => isTriggerLabelMatch(node.textContent) || isTriggerLabelMatch(node.getAttribute('aria-label')));
+        if (exactMatches.length > 0) {
+          // Among exact matches, prefer one that has aria-haspopup or aria-controls (real menu trigger).
+          const triggerExact = exactMatches.filter(isMenuTrigger);
+          return triggerExact[0] || exactMatches[0];
+        }
+        // Fallback to substring matches but ONLY require menu-trigger semantics.
+        const triggerSubstring = nodes.filter((node) => {
+          if (!isMenuTrigger(node)) return false;
           const text = (node.textContent || '').trim().toLowerCase();
           const aria = (node.getAttribute('aria-label') || '').trim().toLowerCase();
-          if (!text && !aria) return false;
           return matchesLabel(text) || matchesLabel(aria);
         });
-        if (matches.length === 0) return null;
-        const menuMatches = matches.filter((node) => isMenuTrigger(node));
-        return menuMatches[0] || matches[0];
+        return triggerSubstring[0] || null;
       };
 
       let target = null;
@@ -851,8 +887,13 @@ function selectGeminiToolScript(labels) {
         if (roots !== rootGroups[rootGroups.length - 1]) continue;
       }
 
-      // Fallback: substring match across all candidates
-      for (const node of Array.from(document.querySelectorAll('button, [role="button"]'))) {
+      // Fallback: substring match — but ONLY consider candidates that look like menu items
+      // (have role=menuitem* or are inside a [role=menu]). This prevents false positives
+      // where sidebar conv titles like "Iren 研究方案" match because they contain "研究".
+      const safeFallbackCandidates = Array.from(document.querySelectorAll(
+        '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="menu"] button, [role="menu"] [role="button"]'
+      ));
+      for (const node of safeFallbackCandidates) {
         if (!isInteractable(node)) continue;
         const text = (node.textContent || '').trim().toLowerCase();
         const aria = (node.getAttribute('aria-label') || '').trim().toLowerCase();
