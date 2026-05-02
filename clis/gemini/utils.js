@@ -1161,8 +1161,45 @@ export async function openGeminiToolsMenu(page) {
     }
     return false;
 }
+function geminiToolAlreadyActiveScript(labels) {
+    // Returns matched label if a deselect-chip is already present in the composer
+    // for one of the requested labels. Used to skip activation (avoid toggling OFF).
+    const labelsJson = JSON.stringify(labels);
+    return `
+    ((targetLabels) => {
+      const labels = Array.isArray(targetLabels) ? targetLabels.filter(Boolean) : [];
+      if (labels.length === 0) return '';
+      // Gemini renders an active-tool chip as a button with aria-label like
+      // "取消选择"Deep Research"" / "Deselect 'Deep Research'". Match the requested label
+      // text inside the aria-label.
+      const chips = Array.from(document.querySelectorAll('button[aria-label]')).filter((el) => {
+        const aria = (el.getAttribute('aria-label') || '');
+        return /取消选择|deselect/i.test(aria);
+      });
+      if (chips.length === 0) return '';
+      for (const chip of chips) {
+        const aria = (chip.getAttribute('aria-label') || '').toLowerCase();
+        const text = (chip.textContent || '').trim().toLowerCase();
+        for (const raw of labels) {
+          const label = String(raw || '').trim().toLowerCase();
+          if (!label) continue;
+          if (aria.includes(label) || text === label) return raw;
+        }
+      }
+      return '';
+    })(${labelsJson})
+  `;
+}
+
 export async function selectGeminiTool(page, labels) {
     await ensureGeminiPage(page);
+    // Idempotency: if a chip for one of the requested tools is already in the
+    // composer, the tool is already activated. Re-clicking it via the menu
+    // would TOGGLE IT OFF, which is the opposite of what the caller wants.
+    const alreadyActive = await page.evaluate(geminiToolAlreadyActiveScript(labels));
+    if (typeof alreadyActive === 'string' && alreadyActive) {
+        return alreadyActive;
+    }
     await openGeminiToolsMenu(page);
     const matched = await page.evaluate(selectGeminiToolScript(labels));
     return typeof matched === 'string' ? matched : '';
