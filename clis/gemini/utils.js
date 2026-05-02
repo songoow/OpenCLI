@@ -1,7 +1,7 @@
 import { CommandExecutionError } from '@jackwener/opencli/errors';
 export const GEMINI_DOMAIN = 'gemini.google.com';
 export const GEMINI_APP_URL = 'https://gemini.google.com/app';
-export const GEMINI_DEEP_RESEARCH_DEFAULT_TOOL_LABELS = ['Deep Research', 'Deep research', '\u6df1\u5ea6\u7814\u7a76'];
+export const GEMINI_DEEP_RESEARCH_DEFAULT_TOOL_LABELS = ['Deep Research', 'Deep research', '\u6df1\u5ea6\u7814\u7a76', '\u7814\u7a76'];
 export const GEMINI_DEEP_RESEARCH_DEFAULT_CONFIRM_LABELS = [
     'Start research',
     'Start Research',
@@ -788,33 +788,80 @@ function selectGeminiToolScript(labels) {
       const lowered = normalized.map((label) => label.toLowerCase());
       if (lowered.length === 0) return '';
 
+      // Two-pass strategy: first look inside menu/dialog containers, then fall back
+      // to the entire document. The 2026 Gemini Chinese UI renders the
+      // 撰写/计划/研究/学习 chips as inline composer buttons (no [role=menu] wrapper),
+      // so we must allow document-wide search for them.
       const menuSelectors = [
         '[role="menu"]',
         '[role="listbox"]',
         '[aria-label*="tool" i]',
         '[aria-label*="mode" i]',
+        '[aria-label*="工具"]',
+        '[aria-label*="模式"]',
         '[aria-modal="true"]',
       ];
       const menuRoots = Array.from(document.querySelectorAll(menuSelectors.join(','))).filter(isVisible);
-      if (menuRoots.length === 0) return '';
+      const rootGroups = menuRoots.length > 0 ? [menuRoots, [document]] : [[document]];
       const seen = new Set();
 
-      for (const root of menuRoots) {
-        const candidates = Array.from(root.querySelectorAll('button, [role="menuitem"], [role="option"], [role="button"], a, li'));
-        for (const node of candidates) {
-          if (seen.has(node)) continue;
-          seen.add(node);
-          if (!isInteractable(node)) continue;
-          const text = (node.textContent || '').trim().toLowerCase();
-          const aria = (node.getAttribute('aria-label') || '').trim().toLowerCase();
-          if (!text && !aria) continue;
-          const combined = \`\${text} \${aria}\`.trim();
-          for (let index = 0; index < lowered.length; index += 1) {
-            const label = lowered[index];
-            if (label && combined.includes(label)) {
-              if (node instanceof HTMLElement) node.click();
-              return normalized[index];
+      // Robust click: dispatch full pointer event sequence (Gemini's MDC ripple
+      // sometimes ignores plain .click()).
+      const clickRobust = (el) => {
+        if (!(el instanceof HTMLElement)) return;
+        try {
+          const rect = el.getBoundingClientRect();
+          const x = rect.left + rect.width / 2;
+          const y = rect.top + rect.height / 2;
+          const eventInit = { bubbles: true, cancelable: true, clientX: x, clientY: y };
+          el.dispatchEvent(new PointerEvent('pointerover', eventInit));
+          el.dispatchEvent(new PointerEvent('pointerenter', eventInit));
+          el.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+          el.dispatchEvent(new MouseEvent('mousedown', eventInit));
+          el.dispatchEvent(new PointerEvent('pointerup', eventInit));
+          el.dispatchEvent(new MouseEvent('mouseup', eventInit));
+          el.dispatchEvent(new MouseEvent('click', eventInit));
+        } catch (_) { /* ignore */ }
+        try { el.click(); } catch (_) { /* ignore */ }
+      };
+
+      for (const roots of rootGroups) {
+        for (const root of roots) {
+          const candidates = Array.from(root.querySelectorAll('button, [role="menuitem"], [role="option"], [role="button"], a, li'));
+          for (const node of candidates) {
+            if (seen.has(node)) continue;
+            seen.add(node);
+            if (!isInteractable(node)) continue;
+            const text = (node.textContent || '').trim().toLowerCase();
+            const aria = (node.getAttribute('aria-label') || '').trim().toLowerCase();
+            if (!text && !aria) continue;
+            for (let index = 0; index < lowered.length; index += 1) {
+              const label = lowered[index];
+              if (!label) continue;
+              // Prefer exact equality (avoids "撰写/计划/研究/学习" prefix issues).
+              // Tool aria labels are like "研究，按钮，点按即可使用工具" — startsWith is reliable.
+              if (text === label || aria === label || aria.startsWith(label + '，') || aria.startsWith(label + ',')) {
+                clickRobust(node);
+                return normalized[index];
+              }
             }
+          }
+        }
+        // After first pass through menuRoots (if any), do a second pass through entire document
+        if (roots !== rootGroups[rootGroups.length - 1]) continue;
+      }
+
+      // Fallback: substring match across all candidates
+      for (const node of Array.from(document.querySelectorAll('button, [role="button"]'))) {
+        if (!isInteractable(node)) continue;
+        const text = (node.textContent || '').trim().toLowerCase();
+        const aria = (node.getAttribute('aria-label') || '').trim().toLowerCase();
+        const combined = \`\${text} \${aria}\`.trim();
+        for (let index = 0; index < lowered.length; index += 1) {
+          const label = lowered[index];
+          if (label && combined.includes(label)) {
+            clickRobust(node);
+            return normalized[index];
           }
         }
       }
@@ -835,21 +882,46 @@ function clickGeminiConfirmButtonScript(labels) {
         return ariaDisabled === 'true';
       };
 
-      const isVisible = (el) => {
-        if (!(el instanceof HTMLElement)) return false;
-        if (el.hidden || el.closest('[hidden]')) return false;
+      // Strict visibility: used for filtering elements that are clearly hidden.
+      const isHardHidden = (el) => {
+        if (!(el instanceof HTMLElement)) return true;
+        if (el.hidden || el.closest('[hidden]')) return true;
         const ariaHidden = el.getAttribute('aria-hidden');
-        if (ariaHidden && ariaHidden.toLowerCase() === 'true') return false;
-        if (el.closest('[aria-hidden="true"]')) return false;
+        if (ariaHidden && ariaHidden.toLowerCase() === 'true') return true;
+        if (el.closest('[aria-hidden="true"]')) return true;
         const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden') return false;
-        if (Number(style.opacity) === 0) return false;
-        if (style.pointerEvents === 'none') return false;
+        if (style.display === 'none' || style.visibility === 'hidden') return true;
         const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
+        return rect.width === 0 && rect.height === 0;
       };
 
+      // Soft visibility: used to score click candidates; opacity:0 / pointer-events:none
+      // are transient during MDC fade animations and should not exclude entirely.
+      const isVisible = (el) => !isHardHidden(el);
+
       const isInteractable = (el) => isVisible(el) && !isDisabled(el);
+
+      // Robust click — Gemini's MDC ripple sometimes ignores plain .click()
+      // unless the surrounding pointer event sequence is dispatched.
+      const clickRobust = (el) => {
+        if (!(el instanceof HTMLElement)) return;
+        try {
+          const rect = el.getBoundingClientRect();
+          const x = rect.left + rect.width / 2;
+          const y = rect.top + rect.height / 2;
+          const eventInit = { bubbles: true, cancelable: true, clientX: x, clientY: y };
+          el.dispatchEvent(new PointerEvent('pointerover', eventInit));
+          el.dispatchEvent(new PointerEvent('pointerenter', eventInit));
+          el.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+          el.dispatchEvent(new MouseEvent('mousedown', eventInit));
+          el.dispatchEvent(new PointerEvent('pointerup', eventInit));
+          el.dispatchEvent(new MouseEvent('mouseup', eventInit));
+          el.dispatchEvent(new MouseEvent('click', eventInit));
+        } catch (_) {
+          /* swallow — fall through to native click */
+        }
+        try { el.click(); } catch (_) { /* ignore */ }
+      };
 
       const normalized = Array.isArray(targetLabels)
         ? targetLabels.map((label) => String(label || '').trim()).filter((label) => label)
@@ -862,6 +934,10 @@ function clickGeminiConfirmButtonScript(labels) {
       const primaryRoots = [...dialogRoots, mainRoot].filter(Boolean).filter(isVisible);
       const rootGroups = primaryRoots.length > 0 ? [primaryRoots, [document]] : [[document]];
       const seen = new Set();
+      let exactMatch = null;
+      let exactLabel = '';
+      let substringMatch = null;
+      let substringLabel = '';
 
       for (const roots of rootGroups) {
         for (const root of roots) {
@@ -873,16 +949,33 @@ function clickGeminiConfirmButtonScript(labels) {
             const text = (node.textContent || '').trim().toLowerCase();
             const aria = (node.getAttribute('aria-label') || '').trim().toLowerCase();
             if (!text && !aria) continue;
-            const combined = \`\${text} \${aria}\`.trim();
             for (let index = 0; index < lowered.length; index += 1) {
               const label = lowered[index];
-              if (label && combined.includes(label)) {
-                if (node instanceof HTMLElement) node.click();
-                return normalized[index];
+              if (!label) continue;
+              // Prefer exact aria-label or text equality (avoids false positives from
+              // longer button labels like "更多研究计划详情" matching "研究计划")
+              if (aria === label || text === label) {
+                if (!exactMatch) { exactMatch = node; exactLabel = normalized[index]; }
+              } else if (!substringMatch) {
+                const combined = \`\${text} \${aria}\`.trim();
+                if (combined.includes(label)) {
+                  substringMatch = node;
+                  substringLabel = normalized[index];
+                }
               }
             }
+            if (exactMatch) break;
           }
+          if (exactMatch) break;
         }
+        if (exactMatch) break;
+      }
+
+      const target = exactMatch || substringMatch;
+      const matchedLabel = exactMatch ? exactLabel : substringLabel;
+      if (target) {
+        clickRobust(target);
+        return matchedLabel;
       }
 
       return '';
